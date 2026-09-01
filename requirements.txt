@@ -1,0 +1,4 @@
+pip~=24.3.1
+streamlit~=1.62.0
+pytest~=9.1.1
+filelock~=3.32.5
