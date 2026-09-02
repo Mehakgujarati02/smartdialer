@@ -2,8 +2,8 @@
 
 **A predictive/progressive collections dialer prototype** — built to show how a dialing system can push agent utilization up (predictive dialing) without ever letting safety limits be bypassed, no matter how aggressive the pacing logic gets.
 
-![Python](https://img.shields.io/badge/python-3.10%2B-blue)
-![Tests](https://img.shields.io/badge/tests-98%20passing-brightgreen)
+
+
 ![Streamlit](https://img.shields.io/badge/UI-Streamlit-ff4b4b)
 ![No external services](https://img.shields.io/badge/dependencies-none%20(no%20DB%2C%20no%20broker)-lightgrey)
 
