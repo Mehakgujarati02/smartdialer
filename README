@@ -85,3 +85,288 @@ This separation is intentional:
 
 Predictive logic controls utilization.
 The Safety Controller controls safety.
+
+Agent States:-
+OFFLINE
+AVAILABLE
+RESERVED
+DIALING
+CONNECTED
+WRAP_UP
+PAUSED
+
+Call states:-
+QUEUED
+   ↓
+RESERVED
+   ↓
+INITIATED
+   ↓
+RINGING
+   ↓
+ANSWERED
+   ↓
+CONNECTED
+   ↓
+COMPLETED
+
+Calls can also transition to:
+
+FAILED
+CANCELLED
+ABANDONED
+Invalid, duplicate, and out-of-order events are rejected by the state machine.
+
+###Concurrency & Crash Recovery:-
+SmartDialer supports safe reservations across multiple workers.
+
+Within a process, threading.Lock protects agent reservation.
+
+Across processes, an OS-level file lock is used through persistent_store.py.
+
+The concurrency test runs 12 separate processes competing for 5 agents and verifies that:
+
+5 reservations succeed
+5 unique agents are assigned
+0 double-bookings occur
+
+The system also performs recovery when a worker crashes while an agent, borrower, or call is still marked as active.
+
+###Mock Telecom Providers:-
+Two interchangeable providers are included:
+
+Provider A — faster and more reliable
+Provider B — slower and can generate timeouts and duplicate events
+
+The providers simulate events such as:
+
+INITIATED
+   ↓
+RINGING
+   ↓
+ANSWERED
+   ↓
+CONNECTED
+   ↓
+COMPLETED
+
+This allows provider failures, duplicate events, timeouts, and other edge cases to be tested without external telecom services.
+
+###Architecture:-
+                    Campaign
+                       │
+                       ▼
+                ┌─────────────┐
+                │   Pacing    │
+                │   Engine    │
+                └──────┬──────┘
+                       │
+                       ▼
+              ┌─────────────────┐
+              │ Safety Controller│
+              └────────┬────────┘
+                       │
+                       ▼
+                ┌─────────────┐
+                │    Call     │
+                │  Allocator  │
+                └──────┬──────┘
+                       │
+                       ▼
+              ┌─────────────────┐
+              │ Telecom Provider│
+              └────────┬────────┘
+                       │
+                       ▼
+                Call Events
+                       │
+                       ▼
+              Event Processor
+                       │
+                       ▼
+              Call State Machine
+
+#Main component:-
+
+| Component                     | Responsibility                    |
+| ----------------------------- | --------------------------------- |
+| `pacing_engine.py`            | Progressive pacing                |
+| `predictive_pacing_engine.py` | Predictive pacing                 |
+| `safety_controller.py`        | Enforces safety limits            |
+| `call_allocator.py`           | Assigns borrowers and agents      |
+| `call_manager.py`             | Manages call state                |
+| `event_processor.py`          | Processes provider events         |
+| `agent_manager.py`            | Manages agent lifecycle           |
+| `borrower_manager.py`         | Manages borrower pool             |
+| `provider_a.py`               | Mock telecom provider A           |
+| `provider_b.py`               | Mock telecom provider B           |
+| `persistent_store.py`         | Persistence, locking and recovery |
+| `app.py`                      | Streamlit simulator               |
+
+###Project  structure:-
+smart-dialer/
+│
+├── app.py
+├── requirements.txt
+│
+├── smartdialer/
+│   ├── models.py
+│   ├── agent_manager.py
+│   ├── agent_lifecycle.py
+│   ├── borrower_manager.py
+│   ├── call_manager.py
+│   ├── call_allocator.py
+│   ├── pacing_engine.py
+│   ├── predictive_pacing_engine.py
+│   ├── safety_controller.py
+│   ├── progressive_dialer.py
+│   ├── predictive_dialer.py
+│   ├── provider.py
+│   ├── provider_a.py
+│   ├── provider_b.py
+│   ├── event_processor.py
+│   └── persistent_store.py
+│
+└── tests/
+
+Testing:-
+
+The project currently has 98 passing tests.
+
+The test suite covers:
+
+State-machine transitions
+Invalid transitions
+Duplicate and out-of-order events
+Progressive dialing
+Predictive overdialing
+Abandoned calls
+Safety Controller decisions
+Provider failures
+Agent lifecycle
+Retry handling
+Concurrency
+Crash recovery
+
+Run:
+
+python -m pytest -q
+
+##Quick Setup:-
+
+Clone
+git clone https://github.com/Mehakgujarati02/smartdialer.git
+cd smartdialer
+
+Install dependencies:-
+pip install -r requirements.txt
+
+Run the simulator:-
+streamlit run app.py
+
+Run tests:-
+python -m pytest -q
+No external database or telecom service is required.
+
+Design Decisions
+
+The prototype intentionally uses:
+
+Python for simple, fast prototyping
+Dataclasses and in-memory state for the core application
+JSON + file locking for cross-process persistence
+Streamlit for the interactive simulator
+Mock telecom providers instead of external services
+
+The storage layer is isolated so that a production database can be introduced later without changing the core dialing logic.
+
+Known Limitations
+
+This is a prototype, so a few limitations remain:
+
+Safety Controller call counts are maintained in memory.
+Answer-rate collapse does not automatically trigger fallback yet.
+An agent going offline during an active call is detected but not automatically reassigned.
+The live UI uses the simpler single-process implementation.
+Benchmarking currently focuses on core operations rather than full load testing.
+Future Improvements
+Replace file-based persistence with a production database
+Add a proper priority queue for borrower selection
+Improve automatic recovery and reassignment
+Add distributed worker support
+Add dedicated load-testing infrastructure
+Improve predictive pacing with more advanced forecasting
+
+
+"How would you build a SmartDialer that gets as much of the utilization benefit of predictive dialing as possible, while retaining the deterministic safety characteristics of progressive dialing?"
+
+
+                    Campaign
+                       |
+                       v
+                Predictive Pacing
+                       |
+              "I suggest N calls"
+                       |
+                       v
+              Safety Controller
+              /      |       \
+           Approve  Reduce   Reject
+                       |
+                       v
+                 Call Allocator
+                       |
+                       v
+               Telecom Provider
+
+The Predictive Pacing Engine does not place calls directly.
+
+It continuously looks at things such as:
+Current available agents
+Recent answer/connect rate
+Average talk time
+Wrap-up time
+Calls currently ringing
+Current abandonment rate
+Provider health
+
+and calculates how aggressively it can dial.
+
+For example:
+10 agents are available and the recent answer rate is 25%, so the predictive engine may suggest dialing more than 10 numbers.
+
+But that suggestion then goes through the Safety Controller.
+
+The Safety Controller enforces hard limits such as:
+Maximum concurrent calls
+Maximum pacing ratio
+Maximum acceptable abandonment rate
+Provider health
+Available agent capacity
+
+So even if the predictive engine says "dial 30 calls", the Safety Controller might say:
+"Only 15 are safe right now."
+
+This is very close to how modern predictive dialers are designed: pacing adapts to live answer rates and agent availability, while abandonment controls act as a hard ceiling rather than something the pacing engine can simply ignore.
+
+The important part: feedback loop
+Your predictive engine shouldn't use a fixed ratio forever.
+It should continuously learn from what actually happened:
+
+Dial calls
+    ↓
+Observe answers
+    ↓
+Measure abandonment
+    ↓
+Update answer-rate estimate
+    ↓
+Recalculate pacing
+    ↓
+Safety Controller
+    ↓
+Dial again
+
+So if the answer rate suddenly goes from 25% → 50%, the system automatically becomes more conservative because many more people are answering.
+If the answer rate drops, it can safely increase pacing to keep agents productive,
+That adaptive feedback loop is the real benefit of predictive dialing.
