@@ -3,8 +3,8 @@
 ### Predictive + Progressive Collections Dialer with Deterministic Safety Controls
 
 SmartDialer is a Python-based dialer prototype that explores how predictive dialing can improve agent utilization while maintaining the safety and concurrency guarantees of progressive dialing.
-![SmartDialer UI](screenshots/smartdialer_ui_png)
-![SmartDialer UI](screenshots/smartdialer_ui_png2)
+![SmartDialer UI](smartdialer/smartdialer_ui_png)
+![SmartDialer UI](smartdialer/smartdialer_ui_png2)
 
 ---
 
