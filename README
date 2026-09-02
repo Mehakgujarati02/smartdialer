@@ -66,4 +66,22 @@ Multiple Calls
 Borrower Answers
        ↓
 Assign Available Agent
+If a borrower answers when no agent is available, the call is marked as ABANDONED rather than leaving the borrower connected to dead air.
 
+###Safety Controller:-
+
+The Safety Controller is the single gatekeeper between pacing decisions and actual calls.
+
+It can:
+
+Approve a request
+Reduce the number of calls
+Reject a request
+Force fallback to progressive pacing
+
+Repeated provider failures can also automatically trigger the safe fallback mode.
+
+This separation is intentional:
+
+Predictive logic controls utilization.
+The Safety Controller controls safety.
