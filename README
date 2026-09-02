@@ -4,7 +4,6 @@
 
 SmartDialer is a Python-based dialer prototype that explores how predictive dialing can improve agent utilization while maintaining the safety and concurrency guarantees of progressive dialing.
 
-![SmartDialer UI]()
 
 ---
 
@@ -30,3 +29,41 @@ Telecom Provider
 Call Events
       ↓
 Call State Machine
+
+The predictive engine can suggest aggressive pacing, but it can never bypass the Safety Controller.
+
+##Key Features:-
+Progressive and predictive dialing modes
+Deterministic Safety Controller
+Agent and call state machines
+Mock telecom providers
+Predictive pacing based on rolling answer rate
+Abandoned-call handling
+Multi-process agent/borrower reservation
+File-based locking for concurrency safety
+Crash recovery
+Provider failure handling
+Retry handling
+Streamlit simulator UI
+98 automated tests
+
+##Progressive vs Predictive:-
+
+Progressive:-
+1 Available Agent
+       ↓
+1 Borrower
+       ↓
+1 Outbound Call
+
+Predictive:-
+Available Agents
+       ↓
+Predictive Pacing
+       ↓
+Multiple Calls
+       ↓
+Borrower Answers
+       ↓
+Assign Available Agent
+
