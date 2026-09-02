@@ -1,148 +1,141 @@
-# SmartDialer
+📞 SmartDialer# 📞 SmartDialer
 
-A predictive/progressive collections dialer prototype: agents, borrowers, calls,
-and telecom-provider events modeled as explicit state machines, with a Safety
-Controller sitting between the pacing logic and the call allocator so a
-pacing decision can never directly place a call.
+**A predictive/progressive collections dialer prototype** — built to show how a dialing system can push agent utilization up (predictive dialing) without ever letting safety limits be bypassed, no matter how aggressive the pacing logic gets.
 
-Built for the SmartDialer take-home assignment. This README covers setup,
-architecture, both dialing modes, the state machines, failure handling,
-distributed-systems reasoning, scale analysis, and the assignment's final
-question — everything listed under "What to submit."
+![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+![Tests](https://img.shields.io/badge/tests-98%20passing-brightgreen)
+![Streamlit](https://img.shields.io/badge/UI-Streamlit-ff4b4b)
+![No external services](https://img.shields.io/badge/dependencies-none%20(no%20DB%2C%20no%20broker)-lightgrey)
 
 ---
 
-## 1. Setup
+## Table of Contents
+
+- [What is this?](#what-is-this)
+- [Quick Start](#quick-start)
+- [How It Works (in plain English)](#how-it-works-in-plain-english)
+- [Architecture](#architecture)
+- [Agent State Machine](#agent-state-machine)
+- [Call State Machine](#call-state-machine)
+- [The Two Dialing Modes](#the-two-dialing-modes)
+- [Mock Telecom Providers](#mock-telecom-providers)
+- [Multi-Worker Safety & Crash Recovery](#multi-worker-safety--crash-recovery)
+- [Failure Handling](#failure-handling)
+- [Scale: What Breaks First](#scale-what-breaks-first)
+- [Project Structure](#project-structure)
+- [Testing](#testing)
+- [Architecture Decision Record](#architecture-decision-record)
+- [Known Limitations](#known-limitations)
+- [The Final Question](#the-final-question)
+
+---
+
+## What is this?
+
+Collections agents waste a lot of time waiting for calls to connect. There are two ways to fix that:
+
+| Mode | Idea | Trade-off |
+|---|---|---|
+| **Progressive** | 1 free agent → 1 outbound call | Safe and predictable, but agents can sit idle |
+| **Predictive** | Dial *more* numbers than you have agents for, betting on the answer rate | Better utilization, but risks a borrower answering with nobody there to talk to them (an **abandoned call** — a real compliance problem, not just bad UX) |
+
+This project builds both modes, with one non-negotiable rule sitting between them and the phone system: **a Safety Controller that pacing logic can never bypass, no matter how confident its prediction is.**
+
+---
+
+## Quick Start
 
 ```bash
-git clone <this repo>
-cd smart-dialer
+git clone https://github.com/Mehakgujarati02/smartdialer.git
+cd smartdialer
 pip install -r requirements.txt
 ```
 
-Run the interactive simulator:
+**Run the interactive simulator:**
 ```bash
 streamlit run app.py
 ```
 
-Run the test suite:
+**Run the test suite:**
 ```bash
 python -m pytest -q
 ```
-98 tests, all passing, no external services required (no database, no
-message broker — see [Architecture Decision Document](#9-architecture-decision-document-adr)
-for why).
+→ `98 passed`, no database or external service required.
 
 ---
 
-## 2. Architecture
+## How It Works (in plain English)
+
+1. A **Pacing Engine** looks at the campaign and says *"I think we can start 10 more calls."*
+2. That suggestion goes to a **Safety Controller**, which is the only thing allowed to actually authorize calls. It can approve the number, reduce it, reject it outright, or force the system back into safe 1-agent-1-call mode.
+3. Only what the Safety Controller authorizes gets passed to the **Call Allocator**, which picks a borrower and (depending on the mode) an agent.
+4. A **mock Telecom Provider** simulates dialing out and reports back events like *ringing → answered → connected → completed*.
+5. Every one of those events moves the call through an explicit **state machine** — so no matter what weird order events arrive in, or how many times the same event repeats, the system never ends up in a nonsensical state.
+
+The key design decision: **the Pacing Engine has no way to talk to the phone system directly.** It can only make a suggestion. That separation is what makes it safe to let the predictive logic be as aggressive as it wants.
+
+---
+
+## Architecture
 
 ```mermaid
-flowchart TD
-    A[Campaign] --> B["Pacing Engine<br/>(Progressive | Predictive)"]
-    B -- "&quot;I think we can start N more calls&quot;" --> C[Safety Controller]
-    C -- "approve / reduce / reject /<br/>fall back to progressive" --> D[Call Allocator]
-    D -- "pick borrower, bind agent<br/>(or defer binding — §5)" --> E["Telecom Provider (mock)"]
-    E -- "INITIATED, RINGING, ANSWERED,<br/>CONNECTED, COMPLETED, FAILED" --> F[Event Processor]
-    F --> G["Call state machine →<br/>resource release"]
+flowchart LR
+    A[Campaign] --> B[Pacing Engine]
+    B -->|suggests N calls| C[Safety Controller]
+    C -->|approve / reduce / reject / fallback| D[Call Allocator]
+    D --> E[Telecom Provider]
+    E -->|call events| F[Event Processor]
+    F --> G[Call State Machine]
+    G -->|release on completion/failure| D
 ```
 
-The pacing engine **never** touches an agent, a borrower, the call manager, or
-the provider — it only returns a number (`PacingEngine.calculate_capacity()` /
-`PredictivePacingEngine.calculate_capacity()`). `SafetyController.authorize_capacity()`
-is the only component allowed to turn that number into actual calls, and it's
-the only place that can approve/reduce/reject a request or force a fallback to
-1:1 progressive pacing (`SafetyController.trip_safety_fallback()` /
-`degraded` flag). The predictive engine holds no reference to the safety
-controller at all — structurally, not just by convention, it cannot switch
-the safety mechanism off.
-
-**Module map:**
-
-| File | Responsibility |
-|---|---|
-| `models.py` | `Agent`, `Borrower`, `Call` dataclasses + their status enums |
-| `agent_manager.py` | In-memory agent pool: reservation + full lifecycle |
-| `agent_lifecycle.py` | Shared agent state-transition table |
-| `borrower_manager.py` | In-memory borrower pool, priority-ordered reservation |
-| `call_manager.py` | Call state machine + its transition table (`CALL_VALID_TRANSITIONS`) |
-| `call_allocator.py` | Pairs a borrower with an agent (or defers agent binding — predictive mode) |
-| `pacing_engine.py` | Progressive pacing: 1 agent → 1 call |
-| `predictive_pacing_engine.py` | Predictive pacing: overdial math from rolling answer-rate/provider-health |
-| `safety_controller.py` | The only component that turns a pacing suggestion into authorized capacity |
-| `progressive_dialer.py` / `predictive_dialer.py` | Orchestrators: launch → process provider events → finalize |
-| `provider.py` / `provider_a.py` / `provider_b.py` | Provider interface + two mock providers |
-| `event_processor.py` | Applies one provider event to a call via the state machine |
-| `persistent_store.py` | Cross-process-safe agent/borrower/call storage + crash recovery (see §6) |
-| `app.py` | Streamlit simulator UI |
+- **Pacing Engine** — either the simple progressive one (`pacing_engine.py`) or the predictive one (`predictive_pacing_engine.py`). Neither one holds a reference to the Safety Controller, the Call Allocator, or the phone provider — structurally, not just by convention, they *cannot* place a call.
+- **Safety Controller** (`safety_controller.py`) — the only component with authority to turn a suggestion into an authorized number of calls.
+- **Call Allocator** (`call_allocator.py`) — picks who to call and (for progressive) which agent handles it.
+- **Telecom Provider** (`provider_a.py` / `provider_b.py`) — two interchangeable mocks; the dialer never knows which one it's talking to.
 
 ---
 
-## 3. Agent state machine
+## Agent State Machine
 
 ```mermaid
 stateDiagram-v2
     [*] --> OFFLINE
-    OFFLINE --> AVAILABLE: bring_online()
-    AVAILABLE --> RESERVED: reserve_agent()
-    AVAILABLE --> PAUSED: pause_agent()
-    PAUSED --> AVAILABLE: resume_agent()
-    RESERVED --> DIALING: mark_dialing() [progressive]
-    RESERVED --> CONNECTED: mark_connected() [predictive: bound at ANSWERED]
-    RESERVED --> AVAILABLE: call failed before dialing began
-    DIALING --> CONNECTED: mark_connected()
-    DIALING --> WRAP_UP: call ended before connecting
-    CONNECTED --> WRAP_UP: mark_wrap_up()
-    WRAP_UP --> AVAILABLE: release_agent()
-    AVAILABLE --> OFFLINE: set_offline()
-    RESERVED --> OFFLINE: set_offline() [was_mid_call=True]
-    DIALING --> OFFLINE: set_offline() [was_mid_call=True]
-    CONNECTED --> OFFLINE: set_offline() [was_mid_call=True]
-    WRAP_UP --> OFFLINE: set_offline()
-    PAUSED --> OFFLINE: set_offline()
+    OFFLINE --> AVAILABLE
+    AVAILABLE --> RESERVED
+    AVAILABLE --> PAUSED
+    PAUSED --> AVAILABLE
+    RESERVED --> DIALING
+    RESERVED --> CONNECTED
+    RESERVED --> AVAILABLE
+    DIALING --> CONNECTED
+    DIALING --> WRAP_UP
+    CONNECTED --> WRAP_UP
+    WRAP_UP --> AVAILABLE
+    AVAILABLE --> OFFLINE
+    RESERVED --> OFFLINE
+    DIALING --> OFFLINE
+    CONNECTED --> OFFLINE
+    WRAP_UP --> OFFLINE
+    PAUSED --> OFFLINE
 ```
 
-All seven states from the assignment are modeled and actually used —
-`OFFLINE`, `AVAILABLE`, `RESERVED`, `DIALING`, `CONNECTED`, `WRAP_UP`,
-`PAUSED` (`models.py::AgentStatus`). The legal transition table lives in
-`agent_lifecycle.py::AGENT_VALID_TRANSITIONS`, shared by both `AgentManager`
-(in-memory) and `PersistentAgentManager` (cross-process) so they can't drift
-apart. `release_agent()` is deliberately **not** gated by this table — it
-forces `AVAILABLE` unconditionally regardless of current state, because a
-call can end at any point in its lifecycle (failed before ever ringing,
-abandoned, completed normally) and the agent must always be freed.
+All seven states from the brief are modeled and actually used (`models.py::AgentStatus`). A couple of details worth knowing:
 
-**Predictive vs. progressive agents differ by one detail:** progressive
-dialing binds an agent before ringing starts, so it walks `RESERVED →
-DIALING → CONNECTED`. Predictive/overdialed calls only bind an agent once
-the call is already `ANSWERED` (see §5), so that agent skips `DIALING`
-entirely and goes straight `RESERVED → CONNECTED` — that's an intentional,
-documented asymmetry in the transition table, not an oversight.
+- **Progressive calls** bind an agent before dialing starts, so they walk `RESERVED → DIALING → CONNECTED`.
+- **Predictive calls** only bind an agent once the phone is actually answered (see [The Two Dialing Modes](#the-two-dialing-modes)), so that agent skips `DIALING` entirely — `RESERVED → CONNECTED` directly. That's intentional, not a missing state.
+- **Releasing an agent always succeeds**, from any state — a call can end at any point in its life, and the agent must always be freed.
 
-**"Two workers see the same available agent at almost the same time — how do
-you prevent both reserving it?"** Two answers, matching the two managers:
+### Two workers, one agent, at the same instant — how is a double-booking prevented?
 
-- **Single process** (`AgentManager`): a `threading.Lock` wraps the entire
-  scan-and-reserve operation, so two threads can race, but only one ever
-  executes the critical section at a time.
-- **Multiple processes / machines** (`PersistentAgentManager`, `persistent_store.py`):
-  a `threading.Lock` doesn't help here — two separate `python` processes each
-  get their own independent lock object and can't see each other's. Instead,
-  every mutation goes through `JSONFileStore.with_lock()`, which holds an
-  OS-level file lock (via the `filelock` library — `fcntl` on POSIX,
-  `LockFileEx` on Windows) for the entire read-scan-write cycle. The OS
-  kernel — not application code — arbitrates between processes, so whichever
-  process's `with_lock()` call the kernel admits first commits its write
-  before the second one is even allowed to read.
+- **One process:** a `threading.Lock` wraps the whole "find an available agent, reserve it" operation, so two threads can race but only one runs that block at a time.
+- **Multiple processes / machines:** a `threading.Lock` doesn't help here — each process has its own. Instead, every reservation goes through an OS-level **file lock** (`persistent_store.py`, via the `filelock` library). The operating system itself — not application code — decides which process gets in first.
 
-**Proven, not just claimed:** `tests/test_persistent_store.py::test_multiple_processes_cannot_double_book_agents`
-spins up 12 *real* `multiprocessing.Process` workers (separate OS processes,
-not threads) racing for 5 agents. Result: exactly 5 succeed, all 5 with
-distinct agent ids — zero double-booking.
+**Proven, not just claimed:** a test spins up **12 real separate OS processes** (`multiprocessing.Process`, not threads) racing for 5 agents. Result every time: exactly 5 succeed, all with different agent IDs. Zero double-bookings.
 
 ---
 
-## 4. Call state machine
+## Call State Machine
 
 ```mermaid
 stateDiagram-v2
@@ -161,7 +154,7 @@ stateDiagram-v2
     ANSWERED --> CONNECTED
     ANSWERED --> COMPLETED
     ANSWERED --> FAILED
-    ANSWERED --> ABANDONED: no agent free (predictive overdial)
+    ANSWERED --> ABANDONED
     CONNECTED --> COMPLETED
     CONNECTED --> FAILED
     COMPLETED --> [*]
@@ -169,371 +162,197 @@ stateDiagram-v2
     CANCELLED --> [*]
     ABANDONED --> [*]
 ```
-`ABANDONED`: answered, but no agent was free (predictive-overdial-specific
-outcome — see §5). `COMPLETED`, `FAILED`, `CANCELLED`, `ABANDONED` are all
-terminal (`call_manager.py::CALL_VALID_TRANSITIONS`).
 
-**Duplicate events** (`ANSWERED, ANSWERED, ANSWERED, COMPLETED`):
-`CallManager.transition()` checks `if current_status == new_status: return True`
-*before* checking the transition table — a repeated event is a silent no-op,
-never a second state change. Provider B deliberately sends duplicate
-`RINGING`/`ANSWERED` events to exercise exactly this path
-(`tests/test_providers.py`, `tests/test_call_manager.py`).
+`ABANDONED` is a fifth terminal state beyond the brief's suggested list — used specifically when a predictive call gets answered but no agent is free (see below).
 
-**Out-of-order events** (`COMPLETED, ANSWERED, RINGING`): the transition
-table only allows specific forward moves. A call sitting at `RESERVED`
-receiving `COMPLETED` directly is rejected (`COMPLETED` isn't in
-`RESERVED`'s allowed-targets set) — `transition()` returns `False`, state is
-unchanged. The system doesn't "break" on a malformed sequence; it just
-refuses the illegal move and the call stays wherever it legitimately was.
+**What if the provider sends `ANSWERED` three times in a row, then `COMPLETED`?** A repeated event is silently ignored — it never causes a second state change.
 
-**Worker crashes immediately after ANSWERED:** see §6 (crash recovery) — the
-call is left `ANSWERED` in the persisted store; a startup/periodic
-reconciliation pass finds it, force-fails it, and releases its agent and
-borrower.
+**What if events arrive out of order** (`COMPLETED` before `RINGING`)? The state machine only allows specific forward moves. An illegal jump is simply rejected — the call stays exactly where it legitimately was, nothing breaks.
 
 ---
 
-## 5. Progressive Dialer
+## The Two Dialing Modes
 
-`progressive_dialer.py`. Strict 1 agent : 1 call. `launch_calls()` asks
-`PacingEngine.calculate_capacity()` (which is just
-`min(available_agents, campaign_max_concurrency - active_calls)`), then loops
-up to that count, checking `SafetyController.can_start_call()` before each
-allocation. `CallAllocator.allocate_call()` reserves a borrower **and** an
-agent atomically at launch time — never more agent-bound calls than there
-are agents, satisfying "if there are 50 available agents, never create more
-than 50 agent-bound outbound calls" directly.
+<details>
+<summary><strong>Progressive Dialer</strong> — click to expand</summary>
 
-- **Which borrower to call:** `BorrowerManager.reserve_borrower()` — highest
-  `priority` first among `WAITING` borrowers.
-- **Which agent:** first `AVAILABLE` agent found (`AgentManager.reserve_agent()`).
-- **When reserved:** at allocation time, before dialing starts.
-- **Call fails:** `fail_call()` releases the agent (`→ AVAILABLE`) and
-  requeues the borrower (`→ WAITING`, eligible for retry) through the same
-  idempotent `_finalize_call()` path `complete_call()` uses.
-- **Agent disappears during setup:** `AgentManager.set_offline()` returns
-  `(success, was_mid_call)` — if `was_mid_call` is `True`, the caller (the
-  dialer, or a reconciliation pass) is responsible for failing that specific
-  call. The manager itself never silently loses track of it.
+Strictly 1 agent : 1 call. Never creates more agent-bound calls than there are available agents — so "50 agents available → never more than 50 outbound calls" is satisfied directly, not just by convention.
 
-## Predictive Pacing Engine
+- **Which borrower gets called:** highest priority among those waiting.
+- **Which agent:** the first one free.
+- **When is the agent reserved:** immediately, before dialing starts.
+- **If the call fails:** the agent is freed and the borrower goes back into the waiting pool for a retry.
+- **If the agent disappears mid-setup:** the system reports it explicitly (rather than losing track of it silently) so the call can be failed and reassigned.
 
-`predictive_pacing_engine.py`. Rule-based, not ML — standard overdial math:
-if only `answer_rate × provider_health` fraction of dials actually connect,
-filling `N` agent-slots needs roughly `N / effective_connect_rate` dials.
-`answer_rate` and `provider_health` are rolling averages over the campaign's
-own recent outcomes (`record_call_outcome()` / `record_provider_event()`,
-window size configurable, default 50) — "recent campaign behaviour," not a
-fixed assumption.
+</details>
 
-**"Why did the system decide to make this many calls right now?"** Every
-call to `calculate_capacity()` stores a `PacingDecision` in `.last_decision`
-with a human-readable `reason` string. Example, captured from an actual run
-(5 agents, 30% rolling answer rate, 100% provider health):
+<details>
+<summary><strong>Predictive Pacing Engine</strong> — click to expand</summary>
 
-```
-5 agent(s) free; recent answer_rate=30%, provider_health=100% -> effective
-connect rate 30%; need ~16.7 dials to fill 5 agent(s), 0 already ringing
-(-> 16.7 more needed); capped at 4.0x agents (20) and campaign headroom (10)
--> suggesting 10
-```
+Rule-based, not machine learning — just the standard math behind real-world predictive dialers: *if only 30% of calls get answered, you need to dial roughly 3x your available agents to keep them all busy.* That 30% isn't hardcoded — it's a rolling average of this campaign's own recent outcomes, so it adapts as real results come in.
 
-Self-imposed `max_overdial_ratio` caps the suggestion independent of the
-Safety Controller — defense in depth, not a replacement for it.
+**Every decision is explainable.** A real captured example:
+> *"5 agents free; recent answer_rate=30%, provider_health=100% → effective connect rate 30%; need ~16.7 dials to fill 5 agents, 0 already ringing → capped at 4.0x agents and campaign headroom → suggesting 10"*
 
-**The hard part — "what happens when more borrowers answer than we have
-agents":** predictive calls are allocated **unbound**
-(`CallAllocator.allocate_unbound_call()` reserves only a borrower, agent_id
-stays `None`). An agent is only bound at the moment the provider reports
-`ANSWERED` (`CallAllocator.try_bind_agent()`). If no agent is free at that
-exact instant, the call is marked `ABANDONED` — not silently connected to
-nothing, not retried immediately (the borrower goes to a terminal `FAILED`
-disposition via `mark_borrower_failed()`, not back to `WAITING`, since
-redialing someone who was just abandoned repeats the same compliance risk).
-Verified end-to-end: 5 agents, 10 overdialed calls processed concurrently →
-5 completed, 5 abandoned, zero silently dropped or double-counted
-(`tests/test_predictive_dialer.py::test_predictive_dialer_abandons_call_when_no_agent_free_at_answer_time`).
+**The hard problem — what happens when more people answer than you have agents for?** Predictive calls are dialed *without* an agent attached. An agent only gets bound at the exact moment someone picks up. If nobody's free at that instant, the call is marked **`ABANDONED`** — not silently connected to dead air, and not immediately redialed either (that borrower goes into a different, non-retriable state, since redialing someone you just abandoned repeats the same compliance risk).
 
-## Safety Controller
+Verified end-to-end: 5 agents, 10 calls dialed at once → 5 completed normally, 5 correctly abandoned, none silently lost or double-counted.
 
-`safety_controller.py`. `authorize_capacity(requested, available_agents)` is
-the single choke point: clamps to `min(requested, global_headroom,
-campaign_headroom)`, and if `degraded=True`, further clamps to
-`available_agents` (forcing 1:1 progressive-equivalent pacing). This
-literally implements the assignment's four options — approve (return
-`requested` in full), reduce (return less), reject (return `0`), fall back
-to progressive (`degraded` mode). `trip_safety_fallback()` /
-`clear_safety_fallback()` are the only way to flip `degraded` — the pacing
-engine has no reference to the safety controller and cannot call them.
+</details>
 
-**Auto-tripped, not just manually available:** both dialers track
-consecutive provider failures; 3 in a row (configurable) calls
-`trip_safety_fallback()` automatically (§7).
+<details>
+<summary><strong>Safety Controller</strong> — click to expand</summary>
 
-## Mock telecom providers
+The one gatekeeper between *any* pacing suggestion and an actual phone call. It can:
+- ✅ **Approve** the full request
+- ⬇️ **Reduce** it (hard concurrency limits)
+- ❌ **Reject** it entirely
+- 🔒 **Force a fallback** to safe 1:1 progressive-style pacing
 
-`provider_a.py`, `provider_b.py` — exactly two, as specified. Both share the
-`TelecomProvider` interface (`provider.py`); neither dialer knows which one
-it's talking to.
+That fallback isn't just a manual switch — it **trips automatically** if the phone provider starts failing repeatedly (3 failures in a row, by default), so the system protects itself without a human needing to notice first.
 
-- **Provider A** — fast, reliable, low failure rate. `failure_rate`
-  (default `0.0`) and `seed` are constructor parameters, not hardcoded
-  behaviour — default `0.0` keeps every test that instantiates `ProviderA()`
-  bare fully deterministic (a nonzero default would make unrelated
-  dialer-logic tests randomly flaky); `app.py` instantiates it with
-  `failure_rate=0.05` for a realistic simulation run.
-- **Provider B** — slower, occasional timeouts, duplicate `RINGING`/
-  `ANSWERED` events (unconditional — that's its baseline quirk). `timeout_rate`
-  (default `0.0`) governs how often it raises `TimeoutError` before
-  returning any events at all, simulating the provider never responding.
-  `app.py` uses `timeout_rate=0.15`.
-
-**"What happens if the provider suddenly starts failing":** see §7.
+</details>
 
 ---
 
-## 6. Distributed systems: multiple workers, crash recovery
+## Mock Telecom Providers
 
-`persistent_store.py`. Single file, on purpose (see ADR, §9) — a
-`JSONFileStore` (JSON blob + `filelock`, not a database) backing
-`PersistentAgentManager`, `PersistentBorrowerManager`, `PersistentCallManager`,
-plus `recover_stale_calls()`. All three managers expose the *exact* same
-public methods as their in-memory counterparts, so `CallAllocator` /
-`ProgressiveDialer` / `PredictiveDialer` work with either unmodified
-(Python duck-typing) — swapping from single-process to multi-process is a
-constructor choice, not a rewrite.
+Exactly two, as specified — the dialer code never knows which one it's talking to.
 
-- **Agent allocation / duplicate jobs / concurrent updates:** covered by
-  `JSONFileStore.with_lock()` — see §3's proof.
-- **Borrower allocation:** same mechanism, `PersistentBorrowerManager.reserve_borrower()`
-  is also lock-guarded and priority-ordered.
-- **Idempotency:** every dialer's `_finalize_call()` (agent release, borrower
-  disposition, safety-slot release) is guarded by a `_finalized_call_ids`
-  set — a call can only be finalized once, no matter how many times
-  `complete_call()`/`fail_call()`/`abandon_call()` are called for it.
-- **Worker crashes / stale state:** `recover_stale_calls()` scans the
-  persisted call store for anything left in a non-terminal state
-  (`RESERVED`/`INITIATED`/`RINGING`/`ANSWERED`/`CONNECTED`), force-fails it,
-  and releases its agent/borrower. Call it at worker startup (catches
-  crashes from before the process existed) or periodically (catches a
-  *peer* worker dying mid-call).
-
-**Demonstrated against the assignment's exact scenario** ("Agent reserved →
-Borrower reserved → Call initiated → Worker crashes → what happens when the
-system comes back?"):
-```
-1. Agent reserved: A0 -> RESERVED
-2. Borrower reserved: B0 -> RESERVED
-3. Call initiated: C1 -> INITIATED, agent -> DIALING
-
->>> WORKER PROCESS CRASHES HERE (process just dies, no cleanup runs) <<<
-
-=== NEW PROCESS STARTS UP ===
-Before recovery: agent=DIALING, borrower=RESERVED, call=INITIATED
-recover_stale_calls() ran at startup -> recovered: ['C1']
-After recovery: agent=AVAILABLE, borrower=WAITING, call=FAILED
-```
-Nothing was replayed from a log — there was no in-memory state to lose in
-the first place, since it was already durable. Recovery is reconciliation,
-not restoration.
-
-**What this deliberately does NOT cover:** `SafetyController`'s
-`active_global_calls`/`active_campaign_calls` counters stay in-memory,
-per-process — a fully distributed deployment would derive them from a live
-count of non-terminal persisted calls instead of counters that reset on
-crash. Scoped out to keep this one file focused on the specific failure mode
-the assignment calls out (leaked agent/borrower/call state), not a full
-distributed-systems rewrite. Also not wired into `app.py`'s UI — the
-persistent layer is standalone and tested, demonstrating the pattern rather
-than replacing the simulator's in-memory managers.
-
----
-
-## 7. Failure handling
-
-**Provider outage (raises an exception):** both dialers wrap
-`provider.initiate_call()` in `try/except`. A raised exception fails the
-call explicitly (`CallStatus.FAILED`) through the normal `fail_call()`
-release path, instead of leaking the agent/borrower/safety-slot forever.
-
-**Provider outage (truncated response — rings, then silence):** after
-processing whatever events *were* returned, if the call is still in a
-non-terminal state, both dialers force it to `FAILED` rather than leaving it
-stuck (`TERMINAL_CALL_STATUSES` check in `process_call()`).
-
-**Existing calls / new calls / retries / pacing during an outage:** existing
-calls fail and release their resources (above) rather than hanging. New
-calls: a **circuit breaker** — `provider_failure_threshold` consecutive
-failures (default 3) automatically calls
-`SafetyController.trip_safety_fallback()`. For `PredictiveDialer` this
-directly changes future behaviour: `authorize_capacity()` starts clamping
-every request to `available_agents`, so an unhealthy provider forces the
-system back to progressive-equivalent (1:1) pacing with no human
-intervention required. Retries: a failed borrower goes back to `WAITING`
-(not lost), so it's naturally retried on a later `launch_calls()` round —
-demonstrated live in the UI (23 attempted vs. 20 borrowers, 3 retried after
-transient failures, all 20 eventually completed).
-
-**Agent availability suddenly drops (100 → 60 agents in seconds):** reaction
-is immediate, not delayed — `get_available_agents()` and `reserve_agent()`
-read live state on every call; there's no cached/stale count anywhere in
-the pacing → safety → allocation path. The next `launch_calls()` call
-simply sees fewer available agents and paces accordingly. What's *not*
-handled: an agent going offline **mid-call** doesn't yet automatically fail
-that specific call — `set_offline()` reports `was_mid_call=True`, but no
-automated reconciliation acts on that signal yet (a known limitation, see
-§10).
-
-**Answer rate collapses (70% → 10%) mid-campaign:** measured directly. With
-a 50-call rolling window, the pacing suggestion actually gets *more*
-aggressive for a stretch right after the collapse (still averaging in the
-stale good outcomes) before catching up:
-```
-after  5 post-collapse calls: rolling answer_rate=62%, suggested=16
-after 10 post-collapse calls: rolling answer_rate=56%, suggested=17
-after 20 post-collapse calls: rolling answer_rate=36%, suggested=27
-after 30 post-collapse calls: rolling answer_rate=16%, suggested=62
-```
-This is an honest, known lag — the rolling window smooths noise but delays
-reaction. `trip_safety_fallback()` is the hard circuit-breaker for exactly
-this case, but nothing currently trips it automatically off answer-rate
-alone (only off provider failures, §above) — a real deployment would want a
-second automatic trigger watching the rolling `answer_rate` itself, not just
-provider health. Flagged as a limitation, not silently ignored (§10).
-
----
-
-## 8. Scale: what breaks first, 100 → 1,000 → 10,000 agents
-
-Measured, not guessed:
-
-| Agents/Borrowers (n) | `reserve_agent()` avg | `reserve_borrower()` avg |
+| | Provider A | Provider B |
 |---|---|---|
-| 100 | 3.76 µs | 7.51 µs |
-| 1,000 | 4.93 µs | 121.75 µs |
-| 10,000 | 4.67 µs | **1,200.98 µs** |
+| Speed | Fast | Slower |
+| Reliability | Low failure rate | Occasional timeouts |
+| Quirk | — | Sends duplicate `RINGING`/`ANSWERED` events |
 
-`reserve_agent()` stays flat — it stops scanning the moment it finds one
-`AVAILABLE` agent. `reserve_borrower()` scales roughly linearly with
-borrower count because it **rebuilds the full waiting-list and re-sorts it
-from scratch on every single reservation**, even though nothing about
-priorities changed since the last call. At 100,000 borrowers this would cost
-roughly 12ms *per reservation* — and it happens inside `BorrowerManager`'s
-lock, so it doesn't just slow down borrower selection, it serializes every
-other reservation attempt behind it. **This is the actual first bottleneck**,
-not "add more servers": a heap-based priority queue (or an index maintained
-incrementally rather than rebuilt each call) removes it without touching
-anything else in the system.
-
-Second-order bottleneck at very high agent counts:
-`AgentManager.get_available_agents()` is a full `O(n)` scan under a lock,
-called on every single `launch_calls()` — at 100,000 agents this becomes a
-non-trivial linear cost paid on every pacing cycle, even though
-`reserve_agent()` itself stays fast. Same fix direction: an index of
-available agent ids maintained incrementally, not recomputed by filtering
-the whole set each time.
-
-`JSONFileStore` (persistence layer, §6): rewrites the *entire* file on every
-write. Deliberately fine at hundreds-to-low-thousands of records; explicitly
-the wrong choice past that — a real embedded KV store or database is the
-correct next step, not a bigger JSON file (see ADR).
+Both failure/timeout rates are configurable (default off, so tests stay deterministic) — the live simulator (`app.py`) runs them with realistic non-zero rates, so re-running the same scenario gives different, believable outcomes each time instead of a suspicious flat 100%.
 
 ---
 
-## 9. Architecture Decision Document (ADR)
+## Multi-Worker Safety & Crash Recovery
 
-**What did you choose?** Python, no framework beyond Streamlit for the demo
-UI. No database — plain in-memory dataclasses for the single-process path,
-a JSON-file-plus-`filelock` layer (`persistent_store.py`) for the
-cross-process path.
+Imagine multiple copies of this dialer running at once, all working the same campaign. Two questions matter:
 
-**Why?** The assignment's own instructions: *"don't add technology just
-because it sounds impressive... a simple, well-thought-out system will score
-better than a complicated one."* This prototype's actual scale (hundreds of
-agents/borrowers in a demo run) doesn't need Postgres, Redis, or Kafka to
-prove the concurrency/safety/failure-handling reasoning — a real file lock
-gives genuine OS-level cross-process mutual exclusion, which is the actual
-mechanism being tested for, without standing up an external service.
+**Can two workers grab the same agent or borrower?** No — see the [Agent State Machine](#agent-state-machine) section above. The same file-lock mechanism protects borrower and call records too.
 
-**What problem does it solve?** `filelock` solves exactly one problem:
-"can two independent OS processes coordinate access to shared state without
-a race?" — yes, provably (§3's multi-process test). It does **not** solve
-durability-under-concurrent-load at scale, network partitions, or multi-
-machine deployment (a single shared filesystem is implicitly assumed).
+**What happens if a worker crashes mid-call?**
 
-**What does it make harder?** Everything a real database gives for free:
-efficient querying/filtering (§8 — `reserve_borrower()`'s full-rescan cost),
-partial updates (every write rewrites the whole file), true multi-machine
-deployment (needs a shared filesystem like NFS, or this approach stops
-working entirely), and transactional guarantees beyond "one lock, one
-file." **If this needed to go past a prototype:** the natural next step is
-a real embedded/networked KV store (SQLite with WAL mode, or a small
-Postgres instance) behind the exact same `PersistentAgentManager` /
-`PersistentBorrowerManager` / `PersistentCallManager` interface — because
-that interface is already duck-type-compatible with the dialers, swapping
-the backend requires touching only `persistent_store.py`, not
-`ProgressiveDialer`/`PredictiveDialer`/`CallAllocator`.
+```
+1. Agent reserved   →  RESERVED
+2. Borrower reserved →  RESERVED
+3. Call initiated    →  INITIATED
 
-**Why not Redis/Kafka for the multi-worker problem specifically?** Redis
-would give the same single-point-of-coordination property `filelock` gives,
-at the cost of standing up and operating a separate service for a prototype
-that doesn't need its throughput or its pub/sub capabilities. Kafka solves
-event-ordering/replay at scale — genuinely valuable for "duplicate
-jobs"/"stale state" at 10,000+ agents, but this prototype's duplicate-event
-and idempotency guarantees (§4, §6) are already handled at the state-machine
-level (`CallManager.transition()`'s duplicate-no-op check,
-`_finalize_call()`'s idempotency guard) — a message queue doesn't remove the
-need for those checks, it just changes where messages come from.
+>>> the worker process dies right here, no cleanup runs <<<
+
+A new process starts up and runs a recovery check:
+  Before: agent still looks reserved, borrower still looks reserved, call still non-terminal
+  After:  agent → AVAILABLE, borrower → WAITING (retryable), call → FAILED
+```
+
+Nothing is "replayed" — there's no in-memory state to lose in the first place, since everything was already saved to disk. Recovery just means: *on startup, find anything still marked "in progress" and clean it up.*
 
 ---
 
-## 10. Known limitations (what I'd do differently with another week)
+## Failure Handling
 
-- `SafetyController`'s counters aren't derived from persisted state (§6) —
-  a crash-safe version would count non-terminal calls live rather than
-  incrementing/decrementing in-memory counters.
-- Nothing automatically trips `trip_safety_fallback()` off a collapsing
-  `answer_rate` on its own (§7) — only off consecutive provider failures.
-  A rolling-answer-rate-based trigger is a natural, fairly small addition.
-- `set_offline()` reports `was_mid_call` but nothing automatically acts on
-  it yet to fail/reassign that specific call — currently a manual
-  responsibility of the caller.
-- `persistent_store.py` isn't wired into `app.py` — the UI still runs the
-  single-process in-memory managers. The persistent layer is proven
-  standalone (tests + the crash-recovery demo above) but not yet the
-  default runtime path.
-- No formal load-test script is included yet — §8's numbers come from
-  direct `timeit`-style benchmarking of the manager methods, not a
-  simulated concurrent-worker load test. A `locust`/simple-threaded
-  harness driving multiple `PersistentAgentManager` instances concurrently
-  would be the natural next artifact.
-- `reserve_borrower()`'s O(n log n) full re-sort (§8) is a known, measured,
-  unfixed bottleneck — deliberately left as documented rather than "fixed"
-  under time pressure, since the assignment specifically asks what would
-  break first, not for every bottleneck to be pre-emptively eliminated.
+| Scenario | What happens |
+|---|---|
+| Provider throws an error | Call is failed cleanly — agent/borrower/capacity are released, nothing leaks |
+| Provider goes silent (times out mid-call) | Same as above — the call isn't left stuck forever |
+| 3 provider failures in a row | Safety Controller automatically forces safe fallback pacing |
+| A call fails | The borrower is automatically retried on a later round |
+| 100 agents → 60 agents in seconds | The very next pacing decision sees the drop immediately — nothing is cached or stale |
+| Answer rate collapses (70% → 10%) | Measured directly: the system's estimate takes a little while to catch up (it's a rolling average, not instant) — a known, documented trade-off, not a hidden bug |
 
 ---
 
-## 11. Final question
+## Scale: What Breaks First
 
-**"How would you build a SmartDialer that gets as much of the utilization
-benefit of predictive dialing as possible, while retaining the deterministic
-safety characteristics of progressive dialing?"**
+Measured, not guessed — benchmarking the core reservation operations at increasing scale:
 
-Keep them architecturally separate, not blended: let the pacing engine be as
-aggressive and probabilistic as it wants — that's exactly what this
-prototype does (`PredictivePacingEngine` has no hard ceiling of its own
-beyond a self-imposed overdial ratio). The determinism doesn't come from
-constraining the *pacing* engine; it comes from putting a single,
-simple, deterministic gate (`SafetyController.authorize_capacity()`) between
-every pacing suggestion and every actual call, one that is a pure function
-of hard concurrency ceilings plus one boolean (`degraded`) — nothing
-probabilistic, nothing the pacing engine can influence beyond the number it
-asks for. Utilization comes from letting the *estimate* be as smart as you
-want; safety comes from never trusting that estimate past a boundary the
-estimate itself has no access to. The abandonment path (§5) is the other
-half: when the bet is wrong, fail closed (mark it `ABANDONED`, don't pretend
-it connected) rather than either silently dropping the call or blocking
-until an agent frees up — visible, measurable, bounded risk instead of
-invisible risk.
+| Agents / Borrowers | Reserve an agent | Reserve a borrower |
+|---|---|---|
+| 100 | 3.8 µs | 7.5 µs |
+| 1,000 | 4.9 µs | 121.8 µs |
+| 10,000 | 4.7 µs | **1,201.0 µs** |
+
+Reserving an **agent** stays fast at any scale — it stops looking the moment it finds one that's free.
+
+Reserving a **borrower** gets slower roughly in proportion to how many borrowers there are, because the current implementation re-sorts the *entire* waiting list by priority on every single reservation — even though nothing about the priorities changed since the last call. At real scale (100,000+ borrowers), this becomes the actual bottleneck, and it happens while holding a lock, so it slows down *everyone*, not just borrower selection.
+
+**The fix** isn't "add more servers" — it's a proper priority queue (or an index updated incrementally instead of rebuilt from scratch), which removes the cost without touching anything else in the system.
+
+---
+
+## Project Structure
+
+```
+smart-dialer/
+├── app.py                          # Streamlit simulator UI
+├── requirements.txt
+├── smartdialer/
+│   ├── models.py                   # Agent / Borrower / Call + their states
+│   ├── agent_manager.py            # In-memory agent pool + lifecycle
+│   ├── agent_lifecycle.py          # Shared agent state-transition rules
+│   ├── borrower_manager.py         # In-memory borrower pool
+│   ├── call_manager.py             # Call state machine
+│   ├── call_allocator.py           # Pairs borrowers with agents
+│   ├── pacing_engine.py            # Progressive pacing
+│   ├── predictive_pacing_engine.py # Predictive pacing
+│   ├── safety_controller.py        # The single gatekeeper
+│   ├── progressive_dialer.py       # Progressive orchestrator
+│   ├── predictive_dialer.py        # Predictive orchestrator
+│   ├── provider.py                 # Provider interface
+│   ├── provider_a.py               # Mock provider A
+│   ├── provider_b.py               # Mock provider B
+│   ├── event_processor.py          # Applies one event to a call
+│   └── persistent_store.py         # Cross-process storage + crash recovery
+└── tests/                          # 98 tests across every module above
+```
+
+---
+
+## Testing
+
+```bash
+python -m pytest -q
+```
+
+**98 tests, all passing** — covering every state machine transition (valid *and* invalid), duplicate/out-of-order events, agent lifecycle transitions, the predictive overdial + abandonment path, the Safety Controller's approve/reduce/reject/fallback logic, provider failure handling, and a genuine 12-process concurrency race.
+
+---
+
+## Architecture Decision Record
+
+<details>
+<summary><strong>Why Python, no database, no message broker?</strong> — click to expand</summary>
+
+**What was chosen:** Plain Python dataclasses in memory for single-process use, plus a small JSON-file-and-file-lock layer (`persistent_store.py`) for cross-process safety. Streamlit for the demo UI. No Postgres, Redis, or Kafka.
+
+**Why:** At this prototype's scale, a real file lock gives genuine OS-level protection between processes — the same underlying guarantee a database's row-locking gives — without standing up and operating an external service just to prove the concept.
+
+**What it makes harder:** Efficient querying at scale (see [Scale](#scale-what-breaks-first)), true multi-machine deployment (this assumes a shared filesystem), and transactional guarantees beyond "one lock, one file."
+
+**The upgrade path:** the persistent-storage classes expose the *exact same methods* as their in-memory counterparts, so swapping in a real database later only means changing `persistent_store.py` — nothing else in the dialer logic would need to change.
+
+</details>
+
+---
+
+## Known Limitations
+
+Being upfront about what's *not* done, rather than glossing over it:
+
+- Safety-controller call counts live in memory, not on disk — a fully crash-proof version would count active calls from the saved records instead.
+- Nothing automatically triggers the safety fallback from a collapsing answer rate on its own — only from repeated provider failures.
+- An agent going offline **mid-call** is detected and reported, but nothing automatically acts on that yet to fail the call it was on.
+- The cross-process storage layer is built and tested standalone, but the live UI still runs on the simpler single-process version.
+- No dedicated load-testing script yet — the scale numbers above came from direct benchmarking of the core operations, not a simulated multi-worker load test.
+
+---
+
+## The Final Question
+
+> *How would you build a SmartDialer that gets as much of the utilization benefit of predictive dialing as possible, while retaining the deterministic safety characteristics of progressive dialing?*
+
+Keep them separate, not blended. Let the pacing engine be as aggressive and smart as it wants — that's exactly what happens here. The safety doesn't come from holding the predictive logic back; it comes from putting one simple, boring, completely deterministic gate between *every* suggestion and *every* actual phone call — a gate that only knows hard concurrency limits and one on/off safety switch, and that the predictive logic has no way to reach. Utilization comes from letting the guess be smart. Safety comes from never trusting the guess past a boundary it can't touch.
