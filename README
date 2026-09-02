@@ -250,7 +250,6 @@ Concurrency
 Crash recovery
 
 Run:
-
 python -m pytest -q
 
 ##Quick Setup:-
@@ -269,35 +268,35 @@ Run tests:-
 python -m pytest -q
 No external database or telecom service is required.
 
-Design Decisions
 
-The prototype intentionally uses:
+##Architecture Decision Record:-
+Why Python, no database, no message broker?
 
-Python for simple, fast prototyping
-Dataclasses and in-memory state for the core application
-JSON + file locking for cross-process persistence
-Streamlit for the interactive simulator
-Mock telecom providers instead of external services
+Decision: Plain Python dataclasses in memory for single-process use, plus a small JSON-file-and-file-lock layer (persistent_store.py) for cross-process safety. Streamlit for the demo UI. No Postgres, Redis, or Kafka.
 
-The storage layer is isolated so that a production database can be introduced later without changing the core dialing logic.
+Why??
+At this prototype's scale, a real file lock gives genuine OS-level protection between processes — the same underlying guarantee a database's row-locking gives — without standing up and operating an external service just to prove the concept.
 
-Known Limitations
+What it makes harder
 
-This is a prototype, so a few limitations remain:
+Efficient querying at scale (see Scale: What Breaks First)
+True multi-machine deployment — this assumes a shared filesystem
+Transactional guarantees beyond "one lock, one file"
 
-Safety Controller call counts are maintained in memory.
-Answer-rate collapse does not automatically trigger fallback yet.
-An agent going offline during an active call is detected but not automatically reassigned.
-The live UI uses the simpler single-process implementation.
-Benchmarking currently focuses on core operations rather than full load testing.
-Future Improvements
-Replace file-based persistence with a production database
-Add a proper priority queue for borrower selection
-Improve automatic recovery and reassignment
-Add distributed worker support
-Add dedicated load-testing infrastructure
-Improve predictive pacing with more advanced forecasting
+##Upgrade path:-
+The persistent-storage classes expose the exact same methods as their in-memory counterparts. Swapping in a real database later only means changing persistent_store.py — nothing else in the dialer logic would need to change.
 
+If this needed to scale...	Swap in
+Cross-process safety at low volume (current)	JSON file + file lock
+Real concurrent load, single machine	SQLite (WAL mode)
+Multi-machine, high volume	PostgreSQL / a managed KV store
+
+##Known Limitations:-
+Safety-controller call counts live in memory, not on disk — a fully crash-proof version would count active calls from the saved records instead.
+Nothing automatically triggers the safety fallback from a collapsing answer rate on its own — only from repeated provider failures.
+An agent going offline mid-call is detected and reported, but nothing automatically acts on that yet to fail the call it was on.
+The cross-process storage layer is built and tested standalone, but the live UI still runs on the simpler single-process version.
+No dedicated load-testing script yet — the scale numbers above came from direct benchmarking of the core operations, not a simulated multi-worker load test.
 
 "How would you build a SmartDialer that gets as much of the utilization benefit of predictive dialing as possible, while retaining the deterministic safety characteristics of progressive dialing?"
 
